@@ -2,6 +2,6 @@ all:
 	nasm -f win64 shellcode.asm -o shellcode.obj
 	cl /Od /Zi /Zo test.c shellcode.obj kernel32.lib ntdll.lib
 	-del C:\users\mag\magdump*
-#	test.exe
-	cdb -g -G test.exe
+	test.exe
+#	cdb -g -G test.exe
 

@@ -143,9 +143,20 @@ write_file:
     ; Make a stack frame
     mov rbp, rsp
 
+    ; Save all arguments for partial writes
+    push rcx
+    push rdx
+    push r8
+
     ; Allocate room for the arguments
     sub rsp, 0x50
+
+    ; Initialize the IOSB
     lea rax, [rbp + wf_locals.iosb]
+    mov qword [rax + 0], 0
+    mov qword [rax + 8], 0
+
+    ; Populate the arguments on the stack
     mov qword [rsp + 0x28], rax     ;IoStatusBlock
     mov qword [rsp + 0x30], rdx     ; Buffer
     mov qword [rsp + 0x38], r8      ; Length
@@ -154,16 +165,33 @@ write_file:
 
     ; Pass the register-based arguments (the first 4)
     mov r10, rcx                    ; FileHandle
-    xor rdx, rdx                    ; Event
-    xor r8, r8                    ; ApcRoutine
-    xor r9, r9                    ; ApcContext
+    xor edx, edx                    ; Event
+    xor r8d, r8d                    ; ApcRoutine
+    xor r9d, r9d                    ; ApcContext
 
     ; Call NtWriteFile
     mov eax, 0x08
     syscall
     ; Restore the stack
-    add rsp, 0x50 + wf_locals_size
+    add rsp, 0x50
 
+    ; Restore the parameters
+    pop r8
+    pop rdx
+    pop rcx
+
+    ; Check if we had a failure
+    test eax, eax
+    jnz .failure
+
+    ; Write was successful, check for a partial write
+    cmp r8, qword [rbp + wf_locals.iosb + 8]
+    jne error
+
+
+.failure:
+    ; Free the arguments from the stack as well as the wf_locals
+    add rsp, wf_locals_size
     pop rbp
     ret
 
@@ -183,6 +211,36 @@ shellcode:
         .memory_file: resq 1
         .meminf: resb MEMORY_BASIC_INFORMATION_size
     endstruc
+
+    ; Save all GPR register state
+    push rsp
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+
+    ; Save the address of the register state
+    mov r12, rsp
+
+    ; 16-byte align the stack
+    and rsp, ~0xf
+
+    ; Allocate room for and save the floating point state
+    sub rsp, 512
+    mov r13, rsp
+    fxsave64 [r13]
 
     ; Make room for the locals
     sub rsp, sc_locals_size
@@ -204,7 +262,6 @@ shellcode:
     mov [rbp + sc_locals.info_file], rax
 
     ; Create the filename for the memory layout and register state
-    sub rsp, sc_locals_size
     mov word [rbp + sc_locals.filename + UNICODE_STRING.length], memory_len
     mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], memory_len
     lea rax, [rel memory]
@@ -216,6 +273,22 @@ shellcode:
 
     ; Save the file
     mov [rbp + sc_locals.memory_file], rax
+
+    ; Write the register state to the info file
+    mov rcx, [rbp + sc_locals.info_file]
+    mov rdx, r12
+    mov r8, 8 * 17 ; 16 GPRS + flags
+    call write_file
+    test eax, eax
+    jnz error
+
+    ; Write the floating point state to the info file
+    mov rcx, [rbp + sc_locals.info_file]
+    mov rdx, r13
+    mov r8 , 512
+    call write_file
+    test eax, eax
+    jnz error
 
     ; Base address to scan
     mov r15, 0
@@ -268,8 +341,10 @@ shellcode:
     add rsp, sc_locals_size
 
 .done:
+    icebp
     ; We NtTerminate the process
     mov r10, -1
-    mov edx, 0
+    mov edx, 0x123
     mov eax, 0x2c
     syscall
+
