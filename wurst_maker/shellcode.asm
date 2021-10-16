@@ -1,4 +1,10 @@
-section .text
+section .code
+    ; Calling convention Win10 x64
+    ; rcx (r10)     - 1st arg
+    ; rdx           - 2nd arg
+    ; r8            - 3rd arg
+    ; r9            - 4rth arg
+    ; [rsp + 0x20]  - 5th arg+
 
 struc UNICODE_STRING
     .length: resw 1
@@ -19,98 +25,251 @@ struc OBJECT_ATTRIBUTES
     .security_qos: resq 1
 endstruc
 
-; "AA"
-foop: db 0x41, 0x00, 0x41, 0x00
+struc MEMORY_BASIC_INFORMATION
+    .base_address:       resq 1
+    .allocation_base:    resq 1
+    .allocation_protect: resd 1
+    .partition_id:       resw 1
+    .padding:            resw 1
+    .region_size:        resq 1
+    .state:              resd 1
+    .protect:            resd 1
+    .type:               resd 1
+    .padding1:           resd 1
+endstruc
 
-global shellcode
-shellcode:
+; Invoked on an error
+error:
+    ud2
+
+; Open a file, or error, jumps to `error
+; r10 -> PUNICODE_STRING
+; rax <- HANDLE
+open_file:
     ; Make a struct containing local values
     struc locals
-        ; Output Handle(Pointer to memory) from `NtCreateFile()`
         .handle: resq 1
         .iosb: resq 2
         .objattr: resb OBJECT_ATTRIBUTES_size
-        .allocation_size: resq 1
-        .filename: resb UNICODE_STRING_size
     endstruc
 
-    ; Make some space on the stack
-    sub rsp, 0x100
+    ; Save registers
+    push rbp
+    push rdi
 
-    ; Calling convention Win10 x64
-    ; rcx (r10)     - 1st arg
-    ; rdx           - 2nd arg
-    ; r8            - 3rd arg
-    ; r9            - 4rth arg
-    ; [rsp + 0x20]  - 5th arg+
-
-    ; Get the pointer to the data stored in foop for filename
-    lea rax, [rel foop]
-
-    ; Populate the UNICODE_STRING structure
-    mov word [rsp + locals.filename + UNICODE_STRING.length], 4
-    mov word [rsp + locals.filename + UNICODE_STRING.max_length], 4
-    mov qword [rsp + locals.filename + UNICODE_STRING.ptr], rax
-
-    ; Put the address for the filename structure in rax
-    lea rax, [rsp + locals.filename]
-
-    ; Populate the OJBECT_ATTRIBUTES structure
-    mov dword [rsp + locals.objattr + OBJECT_ATTRIBUTES.length], OBJECT_ATTRIBUTES_size
-    mov qword [rsp + locals.objattr + OBJECT_ATTRIBUTES.root_directory], 0
-    mov qword [rsp + locals.objattr + OBJECT_ATTRIBUTES.object_name], rax
-    mov dword [rsp + locals.objattr + OBJECT_ATTRIBUTES.attributes], 0
-    mov qword [rsp + locals.objattr + OBJECT_ATTRIBUTES.security_desc], 0
-    mov qword [rsp + locals.objattr + OBJECT_ATTRIBUTES.security_qos], 0
-
-    mov qword [rsp + locals.allocation_size], 0
-    ;int3
-
+    ; Make room on the stack for the locals
+    sub rsp, locals_size
+    ; Save the frame pointer
     mov rbp, rsp
 
-    ; Make more space on the stack
-    sub rsp, 0x58
-    ; Put the first parameter in r10
+    ; Zero initialize all the locals
+    cld ; Clear direction flag so that rdi increments
+    mov rdi, rbp
+    xor eax, eax
+    mov ecx, locals_size
+    rep stosb ; Here RDI is the destination openand and eax is the source op
+                ; stosb repeats for ecx times(ecx acts as a counter)
+
+    ; Initialize the object attributes
+    ; Populate the OJBECT_ATTRIBUTES structure
+    mov dword [rsp + locals.objattr + OBJECT_ATTRIBUTES.length], \
+        OBJECT_ATTRIBUTES_size
+    mov qword [rsp + locals.objattr + OBJECT_ATTRIBUTES.object_name], r10
+
+    ; Make room for the arguments on the stack
+    sub rsp, 0x60
+
+    ; Set up the arguments
     lea r10, [rbp + locals.handle]
     ; Pass the DesiredAcess(FILE_GENERIC_WRITE)
-    mov rdx, 0x120116
+    mov edx, 0x120116
     ; Pass ObjectAttributes
     lea r8, [rbp + locals.objattr]
     ; Pass IoStatusBlock
     lea r9, [rbp + locals.iosb]
     ; Pass AllocationSize
-    lea rax, [rbp + locals.allocation_size]
-    mov qword [rsp + 0x20], rax
+    mov qword [rsp + 0x28], 0
     ; FileAttributes (FILE_ATTRIBUTES_NORMAL)
-    mov qword [rsp + 0x28], 0x80
+    mov qword [rsp + 0x30], 0x80
     ; ShareAccess
-    mov qword [rsp + 0x30], 0
+    mov qword [rsp + 0x38], 0
     ; CreateDisposition (FILE_CREATE)
-    mov qword [rsp + 0x38], 2
+    mov qword [rsp + 0x40], 2
     ; CreateOptions
-    mov qword [rsp + 0x40], 0
+    mov qword [rsp + 0x48], 0x20
     ; EaBuffer
-    mov qword [rsp + 0x48], 0
-    ; EaLength
     mov qword [rsp + 0x50], 0
+    ; EaLength
+    mov qword [rsp + 0x58], 0
 
     ; Call NtCreateFile
     mov eax, 0x55
     syscall
 
-    int3
+    ; Jump to error on errors
+    test eax, eax
+    jnz error
 
-    ;int3
+    ; Return the handle
+    mov rax, [rbp + locals.handle]
 
-    ; Call ZwTerminateProcess(GetCurrentProcess(), 0x13371337)
-    ; Put the first parameter in r10 (Handle to process we want to exit)
-    ; We use all f's because it is a shortcut for the current process
-    mov r10, ~0
-    ; Put the second argument in rdx
-    mov rdx, 0x13371337
+    ; Free the arguments from the stack as well as the locals
+    add rsp, 0x60 + locals_size
 
-    ; Provide the necessary syscall
+    ; Restore registers
+    pop rdi
+    pop rbp
+
+    ; Return back
+    ret
+
+; Write to a file based on the handle in `rcx` to an offset into the file at
+; `rdx`
+; rcx -> Handle
+; rdx -> Byte offset in the file to write to
+; r8 -> Buffer pointer to write
+; r9 -> Buffer Length
+; rax <- NtStatus code
+write_file:
+    struc wf_locals
+        .iosb: resq 2
+    endstruc
+
+    ; Save registers
+    push rbp
+
+    ; Make space on the stack
+    sub rsp, wf_locals_size
+    ; Make a stack frame
+    mov rbp, rsp
+
+    ; Allocate room for the arguments
+    sub rsp, 0x50
+    lea rax, [rbp + wf_locals.iosb]
+    mov qword [rsp + 0x28], rax     ;IoStatusBlock
+    mov qword [rsp + 0x30], rdx     ; Buffer
+    mov qword [rsp + 0x38], r8      ; Length
+    mov qword [rsp + 0x40], 0       ; ByteOffset
+    mov qword [rsp + 0x48], 0       ; Key
+
+    ; Pass the register-based arguments (the first 4)
+    mov r10, rcx                    ; FileHandle
+    xor rdx, rdx                    ; Event
+    xor r8, r8                    ; ApcRoutine
+    xor r9, r9                    ; ApcContext
+
+    ; Call NtWriteFile
+    mov eax, 0x08
+    syscall
+    ; Restore the stack
+    add rsp, 0x50 + wf_locals_size
+
+    pop rbp
+    ret
+
+align 2
+memory_info: dw __utf16__('\??\C:\users\mag\magdump.info')
+memory_info_len: equ ($ - memory_info)
+
+align 2
+memory: dw __utf16__('\??\C:\users\mag\magdump.memory')
+memory_len: equ ($ - memory)
+
+global shellcode
+shellcode:
+    struc sc_locals
+        .filename: resb UNICODE_STRING_size
+        .info_file: resq 1
+        .memory_file: resq 1
+        .meminf: resb MEMORY_BASIC_INFORMATION_size
+    endstruc
+
+    ; Make room for the locals
+    sub rsp, sc_locals_size
+    mov rbp, rsp
+
+    ; Create the filename for the memory layout and register state
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.length], \
+        memory_info_len
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], \
+        memory_info_len
+    lea rax, [rel memory_info]
+    mov qword [rbp + sc_locals.filename + UNICODE_STRING.ptr], rax
+
+    ; Open the file
+    lea r10, [rbp + sc_locals.filename]
+    call open_file
+
+    ; Save the file
+    mov [rbp + sc_locals.info_file], rax
+
+    ; Create the filename for the memory layout and register state
+    sub rsp, sc_locals_size
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.length], memory_len
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], memory_len
+    lea rax, [rel memory]
+    mov qword [rbp + sc_locals.filename + UNICODE_STRING.ptr], rax
+
+    ; Open the file
+    lea r10, [rbp + sc_locals.filename]
+    call open_file
+
+    ; Save the file
+    mov [rbp + sc_locals.memory_file], rax
+
+    ; Base address to scan
+    mov r15, 0
+.loop:
+    ; Make room for the syscalls arguments on the stack
+    sub rsp, 0x38
+
+    ; Set up the arguments
+    mov r10, -1 ; ProcessHandle
+    xor rdx, r15 ; BaseAddress
+    xor r8d, r8d ; MemoryInformationClass
+    lea r9, [rbp + sc_locals.meminf] ; MemoryInformation structure
+    mov qword [rsp + 0x28], MEMORY_BASIC_INFORMATION_size ; MemoryInforationLen
+    mov qword [rsp + 0x30], 0
+
+    ; Invoke NtQueryVirtualMemory()
+    mov eax, 0x23
+    syscall
+    ; Restore stack from the call
+    add rsp, 0x38
+
+    ; Make sure the syscall suceeded
+    test eax, eax
+    jnz .done
+
+    ; Update the base address to scan to reflect the size of the region we
+    ; just observed
+    add r15, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.region_size]
+
+    ; Attempt to write the memory region, if the kernel cannot read the memory
+    ; this will fail and we'll got to the next section
+    mov rcx, [rbp + sc_locals.memory_file]
+    mov rdx, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.base_address]
+    mov r8, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.region_size]
+    call write_file
+    test eax, eax
+    ; Failed to write to file
+    jnz .loop
+
+    mov rcx, [rbp + sc_locals.info_file]
+    lea rdx, [rbp + sc_locals.meminf]
+    mov r8, MEMORY_BASIC_INFORMATION_size
+    call write_file
+    test eax, eax
+    jnz error
+
+    ; Go to the next section
+    jmp .loop
+
+    add rsp, sc_locals_size
+
+.done:
+    ; We NtTerminate the process
+    mov r10, -1
+    mov edx, 0
     mov eax, 0x2c
     syscall
-
-    add rsp, 0x100
