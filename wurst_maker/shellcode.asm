@@ -1,3 +1,5 @@
+[bits 64]
+
 section .code
     ; Calling convention Win10 x64
     ; rcx (r10)     - 1st arg
