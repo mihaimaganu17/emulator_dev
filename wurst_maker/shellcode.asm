@@ -40,6 +40,149 @@ struc MEMORY_BASIC_INFORMATION
     .padding1:           resd 1
 endstruc
 
+shellcode:
+    struc sc_locals
+        .filename: resb UNICODE_STRING_size
+        .info_file: resq 1
+        .memory_file: resq 1
+        .meminf: resb MEMORY_BASIC_INFORMATION_size
+    endstruc
+
+    ; Save all GPR register state
+    push rsp
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+
+    ; Save the address of the register state
+    mov r12, rsp
+
+    ; 16-byte align the stack
+    and rsp, ~0xf
+
+    ; Allocate room for and save the floating point state
+    sub rsp, 512
+    mov r13, rsp
+    fxsave64 [r13]
+
+    ; Make room for the locals
+    sub rsp, sc_locals_size
+    mov rbp, rsp
+
+    ; Create the filename for the memory layout and register state
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.length], \
+        memory_info_len
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], \
+        memory_info_len
+    lea rax, [rel memory_info]
+    mov qword [rbp + sc_locals.filename + UNICODE_STRING.ptr], rax
+
+    ; Open the file
+    lea r10, [rbp + sc_locals.filename]
+    call open_file
+
+    ; Save the file
+    mov [rbp + sc_locals.info_file], rax
+
+    ; Create the filename for the memory layout and register state
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.length], memory_len
+    mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], memory_len
+    lea rax, [rel memory]
+    mov qword [rbp + sc_locals.filename + UNICODE_STRING.ptr], rax
+
+    ; Open the file
+    lea r10, [rbp + sc_locals.filename]
+    call open_file
+
+    ; Save the file
+    mov [rbp + sc_locals.memory_file], rax
+
+    ; Write the register state to the info file
+    mov rcx, [rbp + sc_locals.info_file]
+    mov rdx, r12
+    mov r8, 8 * 17 ; 16 GPRS + flags
+    call write_file
+    test eax, eax
+    jnz error
+
+    ; Write the floating point state to the info file
+    mov rcx, [rbp + sc_locals.info_file]
+    mov rdx, r13
+    mov r8 , 512
+    call write_file
+    test eax, eax
+    jnz error
+
+    ; Base address to scan
+    mov r15, 0
+.loop:
+    ; Make room for the syscalls arguments on the stack
+    sub rsp, 0x38
+
+    ; Set up the arguments
+    mov r10, -1 ; ProcessHandle
+    xor rdx, r15 ; BaseAddress
+    xor r8d, r8d ; MemoryInformationClass
+    lea r9, [rbp + sc_locals.meminf] ; MemoryInformation structure
+    mov qword [rsp + 0x28], MEMORY_BASIC_INFORMATION_size ; MemoryInforationLen
+    mov qword [rsp + 0x30], 0
+
+    ; Invoke NtQueryVirtualMemory()
+    mov eax, 0x23
+    syscall
+    ; Restore stack from the call
+    add rsp, 0x38
+
+    ; Make sure the syscall suceeded
+    test eax, eax
+    jnz .done
+
+    ; Update the base address to scan to reflect the size of the region we
+    ; just observed
+    add r15, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.region_size]
+
+    ; Attempt to write the memory region, if the kernel cannot read the memory
+    ; this will fail and we'll got to the next section
+    mov rcx, [rbp + sc_locals.memory_file]
+    mov rdx, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.base_address]
+    mov r8, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.region_size]
+    call write_file
+    test eax, eax
+    ; Failed to write to file
+    jnz .loop
+
+    mov rcx, [rbp + sc_locals.info_file]
+    lea rdx, [rbp + sc_locals.meminf]
+    mov r8, MEMORY_BASIC_INFORMATION_size
+    call write_file
+    test eax, eax
+    jnz error
+
+    ; Go to the next section
+    jmp .loop
+
+    add rsp, sc_locals_size
+
+.done:
+    ; We NtTerminate the process
+    mov r10, -1
+    mov edx, 0x123
+    mov eax, 0x2c
+    syscall
+
 ; Invoked on an error
 error:
     ud2
@@ -204,149 +347,4 @@ memory_info_len: equ ($ - memory_info)
 align 2
 memory: dw __utf16__('\??\C:\users\mag\magdump.memory')
 memory_len: equ ($ - memory)
-
-global shellcode
-shellcode:
-    struc sc_locals
-        .filename: resb UNICODE_STRING_size
-        .info_file: resq 1
-        .memory_file: resq 1
-        .meminf: resb MEMORY_BASIC_INFORMATION_size
-    endstruc
-
-    ; Save all GPR register state
-    push rsp
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rbp
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-    pushfq
-
-    ; Save the address of the register state
-    mov r12, rsp
-
-    ; 16-byte align the stack
-    and rsp, ~0xf
-
-    ; Allocate room for and save the floating point state
-    sub rsp, 512
-    mov r13, rsp
-    fxsave64 [r13]
-
-    ; Make room for the locals
-    sub rsp, sc_locals_size
-    mov rbp, rsp
-
-    ; Create the filename for the memory layout and register state
-    mov word [rbp + sc_locals.filename + UNICODE_STRING.length], \
-        memory_info_len
-    mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], \
-        memory_info_len
-    lea rax, [rel memory_info]
-    mov qword [rbp + sc_locals.filename + UNICODE_STRING.ptr], rax
-
-    ; Open the file
-    lea r10, [rbp + sc_locals.filename]
-    call open_file
-
-    ; Save the file
-    mov [rbp + sc_locals.info_file], rax
-
-    ; Create the filename for the memory layout and register state
-    mov word [rbp + sc_locals.filename + UNICODE_STRING.length], memory_len
-    mov word [rbp + sc_locals.filename + UNICODE_STRING.max_length], memory_len
-    lea rax, [rel memory]
-    mov qword [rbp + sc_locals.filename + UNICODE_STRING.ptr], rax
-
-    ; Open the file
-    lea r10, [rbp + sc_locals.filename]
-    call open_file
-
-    ; Save the file
-    mov [rbp + sc_locals.memory_file], rax
-
-    ; Write the register state to the info file
-    mov rcx, [rbp + sc_locals.info_file]
-    mov rdx, r12
-    mov r8, 8 * 17 ; 16 GPRS + flags
-    call write_file
-    test eax, eax
-    jnz error
-
-    ; Write the floating point state to the info file
-    mov rcx, [rbp + sc_locals.info_file]
-    mov rdx, r13
-    mov r8 , 512
-    call write_file
-    test eax, eax
-    jnz error
-
-    ; Base address to scan
-    mov r15, 0
-.loop:
-    ; Make room for the syscalls arguments on the stack
-    sub rsp, 0x38
-
-    ; Set up the arguments
-    mov r10, -1 ; ProcessHandle
-    xor rdx, r15 ; BaseAddress
-    xor r8d, r8d ; MemoryInformationClass
-    lea r9, [rbp + sc_locals.meminf] ; MemoryInformation structure
-    mov qword [rsp + 0x28], MEMORY_BASIC_INFORMATION_size ; MemoryInforationLen
-    mov qword [rsp + 0x30], 0
-
-    ; Invoke NtQueryVirtualMemory()
-    mov eax, 0x23
-    syscall
-    ; Restore stack from the call
-    add rsp, 0x38
-
-    ; Make sure the syscall suceeded
-    test eax, eax
-    jnz .done
-
-    ; Update the base address to scan to reflect the size of the region we
-    ; just observed
-    add r15, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.region_size]
-
-    ; Attempt to write the memory region, if the kernel cannot read the memory
-    ; this will fail and we'll got to the next section
-    mov rcx, [rbp + sc_locals.memory_file]
-    mov rdx, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.base_address]
-    mov r8, [rbp + sc_locals.meminf + MEMORY_BASIC_INFORMATION.region_size]
-    call write_file
-    test eax, eax
-    ; Failed to write to file
-    jnz .loop
-
-    mov rcx, [rbp + sc_locals.info_file]
-    lea rdx, [rbp + sc_locals.meminf]
-    mov r8, MEMORY_BASIC_INFORMATION_size
-    call write_file
-    test eax, eax
-    jnz error
-
-    ; Go to the next section
-    jmp .loop
-
-    add rsp, sc_locals_size
-
-.done:
-    icebp
-    ; We NtTerminate the process
-    mov r10, -1
-    mov edx, 0x123
-    mov eax, 0x2c
-    syscall
 

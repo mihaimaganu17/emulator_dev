@@ -27,8 +27,21 @@ int main(void)
     printf("Shellcode is %zd bytes\n", bread);
 
     void *addr = VirtualAllocEx(
-            GetCurrentProcess(), NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+            GetCurrentProcess(), NULL, bread, MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE);
+    if(!addr) {
+        fprintf(stderr, "VirtualAllocEx() error: %d\n", GetLastError());
+        return -1;
+    }
+
+    size_t bwritten = 0;
+    if(!WriteProcessMemory(GetCurrentProcess(), addr, buff, bread, &bwritten)
+        || bwritten != bread) {
+        fprintf(stderr, "WriteProcessMemory() error: %d\n", GetLastError());
+        return -1;
+    }
+
+    ((void (*)(void))addr)();
 
     printf("%p\n", addr);
     return 0;
